@@ -841,7 +841,7 @@ pub(crate) fn retake(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let g = guards();
     mark(&g, first, last);
-    for &page in g.alias_of.range(first..last).flat_map(|(_, links)| links) {
+    for &page in g.alias_of.range(first..last).flat_map(|(_, links)| links.iter()) {
         mark(&g, page, page + 1);
     }
 }
