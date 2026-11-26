@@ -655,6 +655,10 @@ fn list_bench() {
         scaling(&scene, runs, calls);
         return;
     }
+    if std::env::var_os("VICTORY_LIST_BENCH_INDIRECT").is_some() {
+        indirect_scaling(&scene, runs, calls / 4);
+        return;
+    }
     let row = |name: &str, ns: f64| {
         eprintln!("{name:<58} {ns:>9.0} ns");
     };
@@ -929,6 +933,85 @@ fn scaling(scene: &Scene, runs: usize, calls: usize) {
             "draw sequence on {threads} thread(s) at once: {mean:.0} ns a draw, {:.0} ns a call (per thread)",
             mean / 4.0
         );
+    }
+}
+
+/// The list's close as the title calls it, timed with the calls: work a
+/// list defers to its end counts.
+fn close_list(l: &TitleList) {
+    assert_eq!(
+        slot::<extern "system" fn(This) -> HRESULT>(l.list, 0x48)(l.list),
+        S_OK
+    );
+}
+
+fn reset_list(l: &TitleList, pipeline: This) {
+    let reset = slot::<extern "system" fn(This, This, This) -> HRESULT>(l.list, 0x50);
+    assert_eq!(reset(l.list, l.allocator, pipeline), S_OK);
+}
+
+/// ExecuteIndirect (one indexed draw, one dispatch) on one thread and on
+/// five at once, each thread its own list, every [`PER_LIST`] calls the
+/// list's close timed with them. Alone with `VICTORY_LIST_BENCH_INDIRECT=1`.
+fn indirect_scaling(scene: &Scene, runs: usize, calls: usize) {
+    for compute in [false, true] {
+        for threads in [1usize, 5] {
+            let started = std::sync::Barrier::new(threads);
+            let per_thread: Vec<f64> = std::thread::scope(|s| {
+                let handles: Vec<_> = (0..threads)
+                    .map(|_| {
+                        s.spawn(|| {
+                            let (l, pipeline) = if compute {
+                                (compute_list(scene), scene.dispatch)
+                            } else {
+                                (graphics_list(scene), scene.draw[0])
+                            };
+                            let (signature, offset) = if compute {
+                                (scene.dispatch_signature, 0x100)
+                            } else {
+                                (scene.indexed_signature, 0)
+                            };
+                            started.wait();
+                            best(runs, || {
+                                let mut total = Duration::ZERO;
+                                let mut done = 0;
+                                while done < calls {
+                                    let n = PER_LIST.min(calls - done);
+                                    let at = Instant::now();
+                                    for _ in 0..n {
+                                        l.at::<Indirect>(0x1d8)(
+                                            l.list,
+                                            signature,
+                                            1,
+                                            scene.args,
+                                            offset,
+                                            std::ptr::null(),
+                                            0,
+                                        );
+                                    }
+                                    close_list(&l);
+                                    total += at.elapsed();
+                                    done += n;
+                                    reset_list(&l, pipeline);
+                                    if compute {
+                                        set_up_compute(&l, scene);
+                                    } else {
+                                        set_up_graphics(&l, scene);
+                                    }
+                                }
+                                total.as_nanos() as f64 / calls as f64
+                            })
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            let mean = per_thread.iter().sum::<f64>() / threads as f64;
+            let what = if compute { "dispatch" } else { "indexed draw" };
+            eprintln!(
+                "ExecuteIndirect, 1 {what}, with its list's close, on {threads} thread(s) at once: {mean:.0} ns a call (per thread)"
+            );
+        }
     }
 }
 
