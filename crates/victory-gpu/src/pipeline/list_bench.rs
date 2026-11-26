@@ -651,6 +651,10 @@ fn list_bench() {
     let scene = Scene::new();
     let runs = 5;
     let calls = 20_000;
+    if std::env::var_os("VICTORY_LIST_BENCH_SCALING").is_some() {
+        scaling(&scene, runs, calls);
+        return;
+    }
     let row = |name: &str, ns: f64| {
         eprintln!("{name:<58} {ns:>9.0} ns");
     };
@@ -892,19 +896,27 @@ fn list_bench() {
     );
     parts(&scene, &g);
 
-    // Five title threads, each recording its own list of draws, as the
-    // world's render threads do.
+    scaling(&scene, runs, calls);
+    let _ = (scene.out, scene.args_at);
+    drop(g);
+    drop(c);
+}
+
+/// The draw sequence on one thread and on five at once, each recording its
+/// own list of draws, as the world's render threads do. Alone (no other
+/// rows) with `VICTORY_LIST_BENCH_SCALING=1`.
+fn scaling(scene: &Scene, runs: usize, calls: usize) {
     for threads in [1usize, 5] {
         let started = std::sync::Barrier::new(threads);
         let per_thread: Vec<f64> = std::thread::scope(|s| {
             let handles: Vec<_> = (0..threads)
                 .map(|_| {
                     s.spawn(|| {
-                        let l = graphics_list(&scene);
+                        let l = graphics_list(scene);
                         started.wait();
                         best(runs, || {
-                            time(&l, &scene, calls, false, |list, i| {
-                                draw_sequence(&l, &scene, list, i)
+                            time(&l, scene, calls, false, |list, i| {
+                                draw_sequence(&l, scene, list, i)
                             })
                         })
                     })
@@ -918,9 +930,6 @@ fn list_bench() {
             mean / 4.0
         );
     }
-    let _ = (scene.out, scene.args_at);
-    drop(g);
-    drop(c);
 }
 
 /// What a draw's work is made of: each piece of a table entry's and a root
