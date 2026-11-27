@@ -1476,6 +1476,84 @@ pub(crate) mod tests {
         unregister(p, p as u64);
     }
 
+    #[test]
+    #[ignore = "uses the Windows software adapter and synthetic mapped pages"]
+    fn marked_scratch_batch_cost() {
+        use std::time::{Duration, Instant};
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS,
+            IDXGIAdapter1, IDXGIFactory4,
+        };
+        const PAGES: usize = 256;
+        assert!(cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP"));
+        let device = &host().expect("software D3D12 device required").device;
+        // SAFETY: inspect the DXGI adapter actually backing this test device.
+        let desc = unsafe {
+            let dxgi: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter: IDXGIAdapter1 = dxgi.EnumAdapterByLuid(device.GetAdapterLuid()).unwrap();
+            adapter.GetDesc1().unwrap()
+        };
+        assert_ne!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32, 0);
+        let bitmap = bitmap(false).expect("mapped write-mark bitmap");
+        let reverse = std::env::var_os("SCRATCH_REVERSE").is_some();
+        let mut cases = vec![(1, false), (16, false), (256, false), (1, true), (16, true), (256, true)];
+        if reverse {
+            cases.reverse();
+        }
+        for (batch, mixed) in cases {
+            let p = crate::watch::tests::pool(PAGES);
+            let len = PAGES * PAGE;
+            register(p, p as u64, len as u64);
+            let copy = find(p as u64, len as u64).expect("registered shadow");
+            let base = copy.marks.expect("marked title memory") as usize;
+            let mut expected = vec![0u8; len];
+            copy.update(p, len);
+            let mut samples = Vec::new();
+            for step in 1..=10u8 {
+                copy.update(p, len);
+                copy.writing(p, len, true);
+                for i in 0..PAGES {
+                    let offset = i * PAGE;
+                    if mixed && i % 2 == 0 {
+                        copy.write_host((p + offset + 11) as u64, &[step]);
+                        expected[offset + 11] = step;
+                    }
+                    if mixed && i % 16 == 0 {
+                        // SAFETY: emulate a title write next to a shader write on an armed page.
+                        unsafe { ((p + offset + 23) as *mut u8).write_volatile(200 + step) };
+                        expected[offset + 23] = 200 + step;
+                    }
+                }
+                let mut cost = Duration::ZERO;
+                for first in (0..PAGES).step_by(batch) {
+                    for n in (base + first)..(base + first + batch) {
+                        // SAFETY: test owns these write marks and no command list is submitted.
+                        unsafe { *((bitmap.data as *mut u32).add(n / 32)) |= 1 << (n % 32) };
+                    }
+                    let now = Instant::now();
+                    copy_back_marks(&[], false);
+                    cost += now.elapsed();
+                }
+                // SAFETY: both allocations cover len bytes, and the software queue is idle.
+                let title = unsafe { std::slice::from_raw_parts(p as *const u8, len) };
+                // SAFETY: the mapped shadow has the same length and there is no concurrent writer.
+                let shadow = unsafe { std::slice::from_raw_parts(copy.data, len) };
+                assert!(title == expected && shadow == expected, "round {step}, batch {batch}, mixed {mixed}");
+                for n in base..(base + PAGES) {
+                    // SAFETY: reading the same mapped bitmap after processing.
+                    assert_eq!(unsafe { *((bitmap.data as *const u32).add(n / 32)) } & (1 << (n % 32)), 0);
+                }
+                if step > 2 {
+                    samples.push(cost.as_nanos() as u64);
+                }
+            }
+            println!("SCRATCH batch={batch} mixed={mixed} ns={samples:?}");
+            unregister(p, p as u64);
+            drop(copy);
+            crate::watch::tests::free(p);
+        }
+    }
+
     /// Pages shaders marked (`copy_back_marks`, `victory_shader::emit`
     /// "Write marks") go back by the bytes the GPU changed. The title writes
     /// a marked page after the copy took it (the guard saves its bytes from
