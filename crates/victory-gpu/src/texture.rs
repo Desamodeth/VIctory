@@ -367,7 +367,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     if !list.first_use(texture.as_raw() as usize) {
         return;
     }
-    let (Some(staging), Some(copy)) = (staging(resource, texture), crate::resource::host_copy(resource)) else {
+    let (Some(staging), Some(copy)) = (staging(resource), crate::resource::host_copy(resource)) else {
         return;
     };
     // Each list recorded the copy before (run perf7: 149 textures uploaded
@@ -804,7 +804,7 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
 
 /// The staging state of a title texture's host texture, made on first use
 /// (one for all title textures of its memory).
-pub(crate) fn staging(resource: This, _texture: &ID3D12Resource) -> Option<Arc<Staging>> {
+pub(crate) fn staging(resource: This) -> Option<Arc<Staging>> {
     let copy = crate::resource::host_copy(resource)?;
     staging_for(resource, &copy)
 }

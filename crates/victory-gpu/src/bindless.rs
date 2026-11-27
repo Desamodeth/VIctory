@@ -1,4 +1,4 @@
-﻿//! Views shaders reach through the resource heap itself (decision 0007,
+//! Views shaders reach through the resource heap itself (decision 0007,
 //! "Heap-indexed views"). Grand Theft Auto VI is largely bindless: its
 //! shaders load descriptors at indices they take from root constants or
 //! memory (`HostShader::heap`), so no draw names the views it reads. Every

@@ -787,16 +787,6 @@ struct Resource {
     made_with: (u32, Option<[u32; 5]>),
 }
 
-/// A title texture's host copy and the state it is in. The title's barriers
-/// name console states (looser than the host's), so we transition from this
-/// one. Lists that use the texture hold it until they are reset: the title
-/// may release a resource whose commands it recorded but not yet submitted
-/// (console memory outlives the object; a host texture must outlive the
-/// lists that name it).
-///
-/// One per texture memory (decision 0007, "One host texture per texture
-/// memory"): title textures at the same address with the same shape and
-/// element size share it, each viewing it in its own format.
 /// Sentinel values for [`HostTexture::staging_dirty_bit`]: staging has not been
 /// created yet, or has no `watch::DIRTY` bit (untracked memory or bit pool full).
 #[cfg(windows)]
@@ -821,6 +811,16 @@ fn bump_stamp_epoch() {
     STAMP_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
+/// A title texture's host copy and the state it is in. The title's barriers
+/// name console states (looser than the host's), so we transition from this
+/// one. Lists that use the texture hold it until they are reset: the title
+/// may release a resource whose commands it recorded but not yet submitted
+/// (console memory outlives the object; a host texture must outlive the
+/// lists that name it).
+///
+/// One per texture memory (decision 0007, "One host texture per texture
+/// memory"): title textures at the same address with the same shape and
+/// element size share it, each viewing it in its own format.
 #[cfg(windows)]
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
