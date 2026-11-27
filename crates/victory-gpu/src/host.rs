@@ -4131,3 +4131,10 @@ mod present_plane_tests {
         assert_eq!(composite, Some((64, 64, [127, 0, 128, 255])));
     }
 }
+
+#[cfg(all(test, feature = "diagnostics"))]
+impl HostList {
+    pub(crate) fn bench_tracked(&self, copy: &std::sync::Arc<crate::resource::HostTexture>) -> bool {
+        self.states.lock().unwrap().contains_key(&(std::sync::Arc::as_ptr(copy) as usize))
+    }
+}

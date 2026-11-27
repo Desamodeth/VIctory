@@ -1109,3 +1109,96 @@ fn parts(scene: &Scene, g: &TitleList) {
         }),
     );
 }
+
+// Independent #3274 check. The draws share one heap, pipeline and buffers.
+// Only the six SRV identities selected by each recording thread change.
+#[cfg(feature = "diagnostics")]
+#[test]
+#[ignore = "CPU draw-recording timing on software WARP"]
+fn texture_set_scaling() {
+    assert_eq!(std::env::var("VICTORY_D3D12_WARP").as_deref(), Ok("1"));
+    let host = crate::host::host().expect("WARP device");
+    // SAFETY: the factory and host device are live during the adapter query.
+    let desc = unsafe {
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4,
+        };
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+        let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(host.device.GetAdapterLuid()).unwrap();
+        adapter.GetDesc1().unwrap()
+    };
+    let software = windows::Win32::Graphics::Dxgi::DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32;
+    assert_ne!(desc.Flags & software, 0, "software adapter required");
+    let name = String::from_utf16_lossy(&desc.Description);
+    eprintln!("adapter={}", name.trim_end_matches('\0'));
+    let scene = Scene::new();
+    let memory = title_memory(30 << 16);
+    assert_ne!(memory, 0);
+    let srv = [28, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0];
+    let textures: Vec<usize> = (0..30)
+        .map(|k| {
+            let texture = texture_at(memory + (k << 16));
+            let slot = scene.heap_start + 32 * (16 + k);
+            crate::descriptor::create_srv(std::ptr::null(), texture, &srv, slot);
+            texture as usize
+        })
+        .collect();
+    let mut cases = [(1, false), (5, false), (5, true)];
+    let rotation: usize = std::env::var("CASE_ROTATION").unwrap_or_default().parse().unwrap_or(0);
+    cases.rotate_left(rotation % 3);
+    for (threads, disjoint) in cases {
+        let ready = std::sync::Barrier::new(threads);
+        let drawn = crate::draw::drawn();
+        const WARM: usize = 2;
+        const SAMPLES: usize = 8;
+        let windows = std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for worker in 0..threads {
+                let (scene, ready, textures) = (&scene, &ready, &textures);
+                workers.push(scope.spawn(move || {
+                    let list = graphics_list(scene);
+                    let first = if disjoint { 6 * worker } else { 0 };
+                    let table = scene.heap_start + (16 + first as u64) * 32;
+                    let mut samples = Vec::new();
+                    let mut verified = true;
+                    for block in 0..WARM + SAMPLES {
+                        list.at::<Table>(0x120)(list.list, 2, table);
+                        ready.wait();
+                        let start = Instant::now();
+                        for i in 0..PER_LIST {
+                            draw_sequence(&list, scene, list.list, i);
+                        }
+                        let end = Instant::now();
+                        ready.wait(); // keep untimed checks/reset out of other workers' windows
+                        if block >= WARM {
+                            samples.push((start, end));
+                        }
+                        if block == 0 || block == WARM + SAMPLES - 1 {
+                            let host_list = crate::list::host_list(list.list).unwrap();
+                            for (i, &texture) in textures.iter().enumerate() {
+                                let copy = crate::resource::host_copy(texture as This).unwrap();
+                                let expected = (first..first + 6).contains(&i);
+                                verified &= host_list.bench_tracked(&copy) == expected;
+                            }
+                        }
+                        list.close_and_reset(scene.draw[0]);
+                        set_up_graphics(&list, scene);
+                    }
+                    assert!(verified, "unexpected texture set on worker {worker}");
+                    samples
+                }));
+            }
+            workers.into_iter().map(|w| w.join().unwrap()).collect::<Vec<_>>()
+        });
+        let expected_draws = (WARM + SAMPLES) * PER_LIST * threads;
+        assert_eq!(crate::draw::drawn() - drawn, expected_draws as u64);
+        let ns: Vec<_> = (0..SAMPLES)
+            .map(|i| {
+                let first = windows.iter().map(|w| w[i].0).min().unwrap();
+                let last = windows.iter().map(|w| w[i].1).max().unwrap();
+                (last - first).as_nanos()
+            })
+            .collect();
+        eprintln!("WINDOW threads={threads} disjoint={disjoint} draws_per_thread={PER_LIST} ns={ns:?}");
+    }
+}
