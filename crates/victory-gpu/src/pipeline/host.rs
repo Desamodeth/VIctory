@@ -242,7 +242,7 @@ trait DescSink {
         let bytes = name.to_bytes();
         if bytes
             .iter()
-            .all(|&b| (0x20..0x7f).contains(&b) && b != b'"' && b != b'\\')
+            .all(|&b| (0x20..0x7f).contains(&b) && b != b'"' && b != b'\\' && b != b'\'')
         {
             self.push_str("\\\"");
             // SAFETY: checked printable ASCII above.
@@ -1403,7 +1403,7 @@ mod tests {
         custom.targets.RTFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
         custom.depth_format = DXGI_FORMAT_D32_FLOAT;
         custom.samples = DXGI_SAMPLE_DESC { Count: 4, Quality: 1 };
-        let weird = CString::new("A\"B\\C\tD\nE").unwrap();
+        let weird = CString::new("A\"B\\C'D\tE\nF").unwrap();
         let elems = [
             element(DXGI_FORMAT_R32G32B32_FLOAT, 0),
             D3D12_INPUT_ELEMENT_DESC {
