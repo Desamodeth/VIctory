@@ -716,7 +716,9 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         missed
     });
     list.defer_after(move || {
-        if scan_state.swap(SCAN_ALL_ZERO, std::sync::atomic::Ordering::AcqRel) == SCAN_ALL_ZERO {
+        // A miss in an earlier binding can short-circuit this check on the
+        // next execution. Only consume an all-zero result from this run.
+        if scan_state.swap(SCAN_UNKNOWN, std::sync::atomic::Ordering::AcqRel) == SCAN_ALL_ZERO {
             pooled.mark_clean();
             return;
         }
@@ -1031,6 +1033,64 @@ mod tests {
         crate::shadow::unregister(p, p as u64);
         drop(copy);
         crate::watch::tests::free(p);
+    }
+
+    #[test]
+    fn repeated_list_clears_second_bitmap_when_first_heap_misses() {
+        use crate::object::{S_OK, This, slot};
+        let _guard = gpu_test_lock();
+        let (Some(host), Some(_)) = (crate::host::host(), heap()) else {
+            return;
+        };
+        let desc = [0u32, 8, 1, 0, 0, 0, 0, 0]; // shader-visible view heap, no placement
+        let mut heap = std::ptr::null();
+        assert_eq!(
+            crate::descriptor::create_heap(
+                std::ptr::null(), desc.as_ptr().cast(), &crate::resource::PAGEABLE_IIDS[0], &mut heap,
+            ),
+            S_OK
+        );
+        crate::descriptor::heap(heap).host().expect("host view heap");
+        let list = host.new_list().unwrap();
+        let first = bind(&list, OURS).unwrap();
+        let second = bind(&list, heap as usize).unwrap();
+        let (out, cpu) = host.shared_buffer(256).unwrap();
+        // A mark in block zero signals a miss. The shader returns the word
+        // it found in the second heap's bitmap before setting its own bit.
+        let (root, writer) = pipeline(r#"
+RWByteAddressBuffer first : register(u0);
+RWByteAddressBuffer second : register(u1);
+RWByteAddressBuffer result : register(u2);
+[RootSignature("UAV(u0), UAV(u1), UAV(u2)")]
+[numthreads(1, 1, 1)]
+void main() {
+    uint previous;
+    first.InterlockedOr(0, 1);
+    second.InterlockedOr(0, 2, previous);
+    result.Store(0, previous);
+}
+"#);
+        // SAFETY: open list and live UAV buffers for all three root descriptors.
+        unsafe {
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetComputeRootUnorderedAccessView(0, first.dirty);
+            list.list.SetComputeRootUnorderedAccessView(1, second.dirty);
+            list.list.SetComputeRootUnorderedAccessView(2, out.GetGPUVirtualAddress());
+            list.list.SetPipelineState(&writer);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        let mut previous = [0; 3];
+        for word in &mut previous {
+            // SAFETY: the shared output is mapped, and execute waits for completion.
+            unsafe { cpu.cast::<u32>().write_volatile(u32::MAX) };
+            host.execute(&[&list]);
+            // SAFETY: the dispatch has completed.
+            *word = unsafe { cpu.cast::<u32>().read_volatile() };
+        }
+        list.reset();
+        slot::<extern "system" fn(This) -> u32>(heap, 0x10)(heap);
+        assert_eq!(previous, [0; 3], "each submission must see a clean second bitmap");
     }
 
     fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
