@@ -655,12 +655,18 @@ fn remove_watched(g: &mut Guards, page: usize, skip_dirty_update: Option<&Arc<Ch
     }
 }
 
-/// Demotes `page` out of [`Guards::watched`]: polls any pending hardware
-/// write-watch dirty bit into all holders first so no CPU write is lost, and
-/// optionally re-guards `page` immediately if no holder has it marked changed.
+/// Demotes `page` out of [`Guards::watched`]. When `re_guard` is true, installs
+/// the `PAGE_READONLY` guard *before* the final `GetWriteWatch` poll so no CPU
+/// write can slip through the window between polling and protecting: any write
+/// before `VirtualProtect` is caught by the final poll, and any write after
+/// faults into `on_write` (which waits on `GUARDS`).
 fn demote_watched(g: &mut Guards, page: usize, re_guard: bool) {
     if !g.watched.contains(&page) {
         return;
+    }
+    remove_watched(g, page, None);
+    if re_guard {
+        let _ = protect(g, &[page]);
     }
     let dirty = poll_write_watch(page).unwrap_or(true);
     if dirty && let Some(holders) = g.holders.get(&page) {
@@ -669,10 +675,6 @@ fn demote_watched(g: &mut Guards, page: usize, re_guard: bool) {
             set.insert(page);
             set_dirty(c.2, true);
         }
-    }
-    remove_watched(g, page, None);
-    if re_guard && !dirty {
-        let _ = protect(g, &[page]);
     }
 }
 
@@ -727,6 +729,7 @@ impl Tracked {
         #[cfg(feature = "diagnostics")]
         drop(waited);
         let mut whole: Vec<usize> = Vec::with_capacity(pages.len());
+        let mut cooled: Vec<usize> = Vec::new();
         // Poll any hot `MEM_WRITE_WATCH` pages in `[first_page, last_page)`
         // before guarding normal pages: dirty ones are returned directly and
         // reset atomically without `VirtualProtect` or a VEH fault; pages that
@@ -773,9 +776,7 @@ impl Tracked {
                                     }
                                 }
                             }
-                            if pages.binary_search(&p).is_err() {
-                                pages.push(p);
-                            }
+                            pages.push(p);
                             if whole_page {
                                 changed.remove(&p);
                                 self.changed.taken(p);
@@ -796,15 +797,14 @@ impl Tracked {
                                     remove_watched(&mut g, p, Some(&self.changed));
                                     if whole_page {
                                         whole.push(p);
+                                        cooled.push(p);
                                     }
                                 }
                             }
                         }
                         Err(()) => {
                             remove_watched(&mut g, p, Some(&self.changed));
-                            if pages.binary_search(&p).is_err() {
-                                pages.push(p);
-                            }
+                            pages.push(p);
                             if whole_page {
                                 whole.push(p);
                             }
@@ -835,6 +835,45 @@ impl Tracked {
                 changed.remove(&page);
                 self.changed.taken(page);
             }
+        }
+        // Final write-watch poll for pages cooled to `PAGE_READONLY` above:
+        // catches any CPU write that landed in the window between the earlier
+        // `poll_write_watch_run` and `VirtualProtect(PAGE_READONLY)`.
+        if !cooled.is_empty() {
+            let mut i = 0;
+            while i < cooled.len() {
+                let run_first = cooled[i];
+                let mut run_end = i;
+                while run_end + 1 < cooled.len()
+                    && cooled[run_end + 1] == cooled[run_end] + 1
+                    && (run_end + 1 - i) < WATCH_BATCH_PAGES
+                {
+                    run_end += 1;
+                }
+                let run = &cooled[i..=run_end];
+                i = run_end + 1;
+                let batch_mask = poll_write_watch_run(run_first, run.len());
+                for (offset, &p) in run.iter().enumerate() {
+                    let dirty = match batch_mask {
+                        Ok(mask) => (mask >> offset) & 1 != 0,
+                        Err(()) => poll_write_watch(p).unwrap_or(true),
+                    };
+                    if dirty {
+                        if let Some(holders) = g.holders.get(&p) {
+                            for c in holders {
+                                if !Arc::ptr_eq(c, &self.changed) {
+                                    let mut set = c.0.lock().unwrap_or_else(|e| e.into_inner());
+                                    set.insert(p);
+                                    set_dirty(c.2, true);
+                                }
+                            }
+                        }
+                        pages.push(p);
+                    }
+                }
+            }
+            pages.sort_unstable();
+            pages.dedup();
         }
         self.changed.update_dirty(changed.is_empty());
         drop(changed);
