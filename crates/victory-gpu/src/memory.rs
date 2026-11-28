@@ -237,6 +237,8 @@ struct Shared {
     /// The copies' generation it names ([`crate::shadow::generation`]).
     generation: u64,
     layout: Arc<Layout>,
+    /// Largest bitmap prefix addressable by any layout written to this table.
+    bitmap_words: usize,
 }
 
 // SAFETY: `data` is the persistent mapping of `table`, written only under
@@ -519,6 +521,7 @@ impl Shared {
             pairs: HashMap::new(),
             generation: u64::MAX,
             layout: Arc::default(),
+            bitmap_words: BLOCK / 32,
         })
     }
 
@@ -568,19 +571,20 @@ impl Shared {
             blocks,
             owner,
         });
+        self.bitmap_words = self.bitmap_words.max(active_words(&self.layout));
         self.generation = now;
         stats(|s| s.tables += 1);
     }
 }
 
-/// The page table of view heap `key`, as the last submission using it
-/// left it.
-fn layout(key: usize) -> Arc<Layout> {
+/// Decode against the table the list actually bound. If its heap was released,
+/// every mark is a miss and its former size is no longer in the registry.
+fn bitmap_layout(key: usize, table: u64) -> (Arc<Layout>, usize) {
     shared()
         .iter()
-        .find(|(k, _)| *k == key)
-        .map(|(_, s)| s.layout.clone())
-        .unwrap_or_default()
+        .find(|(k, s)| *k == key && s.gpu == table)
+        .map(|(_, s)| (s.layout.clone(), s.bitmap_words))
+        .unwrap_or_else(|| (Arc::default(), BITMAP_WORDS))
 }
 
 /// At submission, for a list using title memory with view heap `key`
@@ -613,8 +617,7 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
 
 /// Number of 32-bit bitmap words covering every block the page table can index
 /// (block 0 for missing 256 MiB regions plus active level-2 blocks `1..blocks.len()`).
-/// Shaders only read block indices `< blocks.len()` from level-1, so words past
-/// this prefix remain zero.
+/// A shader using this particular layout can only mark words inside this prefix.
 fn active_words(l: &Layout) -> usize {
     l.blocks.len().max(1).saturating_mul(BLOCK / 32).min(BITMAP_WORDS)
 }
@@ -701,8 +704,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
     let scan_state = Arc::new(std::sync::atomic::AtomicU8::new(SCAN_UNKNOWN));
     let missed_state = Arc::clone(&scan_state);
     list.defer_missed(move || {
-        let l = layout(key);
-        let words = active_words(&l);
+        let (l, words) = bitmap_layout(key, table);
         missed_bitmap.mark_dirty();
         // SAFETY: the bitmap is mapped for `BITMAP_WORDS` dwords (`words <= BITMAP_WORDS`)
         // and the list's run is over.
@@ -722,8 +724,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             pooled.mark_clean();
             return;
         }
-        let l = layout(key);
-        let words = active_words(&l);
+        let (l, words) = bitmap_layout(key, table);
         let Layout { copies, blocks, owner, .. } = &*l;
         let precise = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the bitmap is mapped for `BITMAP_WORDS` dwords (`words <= BITMAP_WORDS`)
@@ -987,6 +988,31 @@ mod tests {
         drop(PooledBitmap::new(reused));
 
         // Also execute a real writing shader twice on the same list without resetting it.
+        with_recorded_page_write(&list, views, OURS, |at, _| {
+            list.close();
+            // First execution writes 0x77 back to title memory and clears the bitmap.
+            host.execute(&[&list]);
+            // SAFETY: our pool.
+            assert_eq!(unsafe { (at as *const u32).read_volatile() }, 0x77);
+            // Overwrite title memory, then re-execute the SAME list without reset:
+            // defer_missed must still re-scan and defer_after must still copy 0x77 back.
+            // SAFETY: our pool.
+            unsafe { (at as *mut u32).write_volatile(0x22) };
+            host.execute(&[&list]);
+            // SAFETY: our pool.
+            assert_eq!(unsafe { (at as *const u32).read_volatile() }, 0x77);
+            list.reset();
+        });
+        MISSED_IN.store(prev_missed, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // Keep the shader, its registered title page and the shadow alive through submission.
+    fn with_recorded_page_write(
+        list: &HostList,
+        views: &HostHeap,
+        key: usize,
+        run: impl FnOnce(usize, &Map),
+    ) {
         use crate::watch::PAGE;
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
         let p = (0..256u64)
@@ -1003,7 +1029,7 @@ mod tests {
         crate::shadow::register(p, p as u64, PAGE as u64);
         let copy = crate::shadow::find(p as u64, PAGE as u64).unwrap();
         let (write_root, writer) = pipeline(WRITE);
-        let map = bind(&list, OURS).expect("page table");
+        let map = bind(list, key).expect("page table");
         let constants = [at as u32, (at >> 32) as u32, 0x77, 0, 0];
         // SAFETY: open list, live objects.
         unsafe {
@@ -1016,32 +1042,14 @@ mod tests {
             list.list.SetPipelineState(&writer);
             list.list.Dispatch(1, 1, 1);
         }
-        list.close();
-        // First execution writes 0x77 back to title memory and clears the bitmap.
-        host.execute(&[&list]);
-        // SAFETY: our pool.
-        assert_eq!(unsafe { (at as *const u32).read_volatile() }, 0x77);
-        // Overwrite title memory, then re-execute the SAME list without reset:
-        // defer_missed must still re-scan and defer_after must still copy 0x77 back.
-        // SAFETY: our pool.
-        unsafe { (at as *mut u32).write_volatile(0x22) };
-        host.execute(&[&list]);
-        // SAFETY: our pool.
-        assert_eq!(unsafe { (at as *const u32).read_volatile() }, 0x77);
-        list.reset();
-        MISSED_IN.store(prev_missed, std::sync::atomic::Ordering::Relaxed);
+        run(at, &map);
         crate::shadow::unregister(p, p as u64);
         drop(copy);
         crate::watch::tests::free(p);
     }
 
-    #[test]
-    fn repeated_list_clears_second_bitmap_when_first_heap_misses() {
-        use crate::object::{S_OK, This, slot};
-        let _guard = gpu_test_lock();
-        let (Some(host), Some(_)) = (crate::host::host(), heap()) else {
-            return;
-        };
+    fn new_view_heap() -> crate::object::This {
+        use crate::object::S_OK;
         let desc = [0u32, 8, 1, 0, 0, 0, 0, 0]; // shader-visible view heap, no placement
         let mut heap = std::ptr::null();
         assert_eq!(
@@ -1051,6 +1059,72 @@ mod tests {
             S_OK
         );
         crate::descriptor::heap(heap).host().expect("host view heap");
+        heap
+    }
+
+    #[test]
+    fn released_table_still_reports_and_clears_its_shader_marks() {
+        use crate::object::{This, slot};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let _guard = gpu_test_lock();
+        let Some(host) = crate::host::host() else { return };
+        let heap = new_view_heap();
+        let key = heap as usize;
+        let views = crate::descriptor::heap(heap).host().unwrap();
+        let list = host.new_list().unwrap();
+        // Remove only the registry entry after the GPU finishes. The recorded
+        // list keeps its table, and this test holds the descriptor heap.
+        let released = AtomicBool::new(false);
+        list.defer_missed(move || {
+            if !released.swap(true, Ordering::Relaxed) {
+                release(key);
+            }
+            false
+        });
+        with_recorded_page_write(&list, views, key, |_, map| {
+            let reached = Arc::new(AtomicBool::new(false));
+            let witness = reached.clone();
+            list.defer_missed(move || {
+                witness.store(true, Ordering::Relaxed);
+                false
+            });
+            list.close();
+            host.execute(&[&list]);
+            // A detected miss short-circuits the next check on this list.
+            let missed = !reached.load(Ordering::Relaxed);
+
+            // Replay the old list with a new page table registered under the same
+            // key. Even when the replacement names the same page, it cannot own
+            // the old table's marks.
+            let replacement = host.new_list().unwrap();
+            let next = bind(&replacement, key).unwrap();
+            assert_ne!(next.table, map.table);
+            replacement.close();
+            reached.store(false, Ordering::Relaxed);
+            host.execute(&[&list]);
+            let missed_on_replay = !reached.load(Ordering::Relaxed);
+            list.reset();
+            let bitmap = Bitmap::acquire().unwrap();
+            assert_eq!(bitmap.gpu, map.dirty);
+            // SAFETY: this mapped bitmap is exclusively ours after reset.
+            let words = unsafe { std::slice::from_raw_parts(bitmap.data as *const u32, BITMAP_WORDS) };
+            let clean = words.iter().all(|&word| word == 0);
+            assert!(missed, "a mark from the released table must be reported");
+            assert!(missed_on_replay, "a different table recorded under the same key must not claim the mark");
+            assert!(clean, "the recycled bitmap must be clear");
+        });
+        slot::<extern "system" fn(This) -> u32>(heap, 0x10)(heap);
+    }
+
+    #[test]
+    fn repeated_list_clears_second_bitmap_when_first_heap_misses() {
+        use crate::object::{This, slot};
+        let _guard = gpu_test_lock();
+        let (Some(host), Some(_)) = (crate::host::host(), heap()) else {
+            return;
+        };
+        let heap = new_view_heap();
         let list = host.new_list().unwrap();
         let first = bind(&list, OURS).unwrap();
         let second = bind(&list, heap as usize).unwrap();
